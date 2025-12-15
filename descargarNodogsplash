@@ -1,0 +1,27 @@
+# 1. Actualizar la lista de paquetes
+opkg update
+
+# 2. Instalar Nodogsplash
+opkg install nodogsplash
+
+# 3. Habilitar el servicio para que inicie con el router
+/etc/init.d/nodogsplash enable
+
+# 4. Iniciar el servicio ahora mismo
+/etc/init.d/nodogsplash start
+
+# 1. Actualizar repositorios e instalar dependencias necesarias
+sudo apt-get update
+sudo apt-get install git build-essential libmicrohttpd-dev
+
+# 2. Clonar (descargar) el código fuente desde GitHub
+git clone https://github.com/nodogsplash/nodogsplash.git
+
+# 3. Entrar en la carpeta descargada
+cd nodogsplash
+
+# 4. Compilar el código
+make
+
+# 5. Instalar el programa compilado
+sudo make install
