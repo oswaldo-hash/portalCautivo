@@ -1,0 +1,274 @@
+#!/bin/bash
+
+################################################################################
+# Script: Portal Cautivo "Hardcore" (Hostapd Manual)
+# Propósito: Usar hostapd + dnsmasq manualmente (Método probado por el usuario)
+# SO Objetivo: Kali Linux (evitando conflictos de NM)
+################################################################################
+
+# Colores
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Configuración
+SSID="Portal_WIFI"
+PASSPHRASE="12345678"
+GATEWAY_IP="192.168.10.1" # IP solicitada por usuario
+DHCP_RANGE="192.168.10.10,192.168.10.250,12h"
+INTERFACE_WIFI="wlan0"
+INTERFACE_INET=""
+
+################################################################################
+# Helpers
+################################################################################
+log() { echo -e "${GREEN}[*]${NC} $1"; }
+error() { echo -e "${RED}[!]${NC} $1"; }
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error "Este script requiere root."
+        exit 1
+    fi
+}
+
+################################################################################
+# 1. Preparación y Limpieza (Kill them all)
+################################################################################
+prepare_system() {
+    log "Detectando interfaz de internet..."
+    INTERFACE_INET=$(ip route | grep default | awk '{print $5}' | head -n 1)
+    if [[ -z "$INTERFACE_INET" ]]; then
+        log " No hay internet. El portal funcionará en modo local."
+    else
+        log " Internet detectado en: $INTERFACE_INET"
+    fi
+
+    log "Limpiando entorno y liberando $INTERFACE_WIFI..."
+    
+    # 1. Limpieza de IPTABLES (Reset total)
+    log " > Reseteando iptables..."
+    iptables -F
+    iptables -X
+    iptables -t nat -F
+    iptables -t nat -X
+    iptables -t mangle -F
+    iptables -t mangle -X
+    iptables -P INPUT ACCEPT
+    iptables -P FORWARD ACCEPT
+    iptables -P OUTPUT ACCEPT
+
+    # 2. Detener servicios conflictivos (Solo Wifi/DNS/Portal)
+    log " > Deteniendo servicios..."
+    systemctl stop hostapd 2>/dev/null
+    systemctl stop dnsmasq 2>/dev/null
+    systemctl stop nodogsplash 2>/dev/null
+    systemctl stop hostapd 2>/dev/null
+    systemctl stop dnsmasq 2>/dev/null
+    systemctl stop nodogsplash 2>/dev/null
+    # Nota: No matamos wpa_supplicant porque NM lo necesita/gestiona.
+    # Al poner 'managed no', NM debería dejar de usar wlan0 en wpa_supplicant.
+    
+    killall hostapd 2>/dev/null
+    killall dnsmasq 2>/dev/null
+    killall nodogsplash 2>/dev/null
+
+    # 3. Gestionar NetworkManager sin matarlo (Para mantener eth0)
+    # 3. Gestionar NetworkManager (Truco: Apagar radio WIFI desde NM, luego encenderla fisicamente)
+    # Esto evita que NM/wpa_supplicant toquen la tarjeta, pero nos permite usarla con hostapd.
+    if command -v nmcli &>/dev/null; then
+        log " > Desactivando WiFi en NetworkManager (Para evitar conflictos)..."
+        nmcli radio wifi off 2>/dev/null
+        
+        log " > Asegurando desbloqueo físico (rfkill)..."
+        rfkill unblock wifi
+        rfkill unblock all
+        
+        # Esperar a que el hardware despierte de nuevo
+        sleep 2
+    else
+        log " > NetworkManager no detectado o nmcli no instalado."
+        rfkill unblock wifi
+        rfkill unblock all
+    fi
+
+    # 4. Desbloqueo RF
+    rfkill unblock wifi
+    rfkill unblock all
+
+    log "Configurando IP estática en $INTERFACE_WIFI..."
+    ip link set "$INTERFACE_WIFI" down
+    ip addr flush dev "$INTERFACE_WIFI"
+    ip addr add "$GATEWAY_IP/24" dev "$INTERFACE_WIFI"
+    ip link set "$INTERFACE_WIFI" up
+}
+
+################################################################################
+# 2. Configurar hostapd
+################################################################################
+setup_hostapd() {
+    log "Generando /etc/hostapd/hostapd.conf..."
+    # Configuración básica y robusta
+    cat > /etc/hostapd/hostapd.conf <<EOF
+interface=$INTERFACE_WIFI
+driver=nl80211
+ssid=$SSID
+hw_mode=g
+channel=6
+macaddr_acl=0
+auth_algs=1
+ignore_broadcast_ssid=0
+wmm_enabled=0
+
+# WPA2
+wpa=2
+wpa_passphrase=$PASSPHRASE
+wpa_key_mgmt=WPA-PSK
+wpa_pairwise=TKIP
+rsn_pairwise=CCMP
+EOF
+}
+
+################################################################################
+# 3. Configurar dnsmasq
+################################################################################
+setup_dnsmasq() {
+    log "Generando /etc/dnsmasq.conf..."
+    # Matar systemd-resolved que suele ocupar puerto 53
+    systemctl stop systemd-resolved 2>/dev/null
+    systemctl disable systemd-resolved 2>/dev/null
+
+    cat > /etc/dnsmasq.conf <<EOF
+interface=$INTERFACE_WIFI
+bind-interfaces
+server=8.8.8.8
+server=1.1.1.1
+domain-needed
+bogus-priv
+dhcp-range=$DHCP_RANGE
+address=/#/$GATEWAY_IP
+log-queries
+log-dhcp
+EOF
+}
+
+################################################################################
+# 4. Configurar IPTABLES (NAT)
+################################################################################
+setup_firewall() {
+    log "Configurando Firewall y NAT..."
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+
+    iptables -F
+    iptables -t nat -F
+
+    if [[ -n "$INTERFACE_INET" ]]; then
+        iptables -t nat -A POSTROUTING -o "$INTERFACE_INET" -j MASQUERADE
+    fi
+
+    # CRÍTICO: Permitir DHCP explícitamente
+    iptables -A INPUT -i "$INTERFACE_WIFI" -p udp --dport 67:68 --sport 67:68 -j ACCEPT
+
+    # Permitir tráfico del portal
+    iptables -A INPUT -i "$INTERFACE_WIFI" -j ACCEPT
+    iptables -A FORWARD -i "$INTERFACE_WIFI" -j ACCEPT
+}
+
+################################################################################
+# 5. Configurar NoDogSplash
+################################################################################
+setup_nodogsplash() {
+    log "Configurando NoDogSplash (Reglas Estrictas)..."
+    cat > /etc/nodogsplash/nodogsplash.conf <<EOF
+GatewayInterface $INTERFACE_WIFI
+GatewayAddress $GATEWAY_IP
+MaxClients 250
+AuthIdleTimeout 480
+
+# Solo permitir DNS antes de autenticar
+# Bloqueamos el resto para garantizar redirección al portal
+FirewallRuleSet preauthenticated-users {
+    FirewallRule allow tcp port 53
+    FirewallRule allow udp port 53
+    FirewallRule allow udp port 67
+    FirewallRule allow udp port 68
+}
+
+# Usuarios autenticados tienen acceso libre
+FirewallRuleSet authenticated-users {
+    FirewallRule allow all
+}
+EOF
+}
+
+################################################################################
+# MAIN: Iniciar todo
+################################################################################
+start_services() {
+    LOG_OUTPUT="/var/log/portal_hostapd.log"
+    log "Iniciando hostapd (Log: $LOG_OUTPUT)..."
+
+    hostapd -B /etc/hostapd/hostapd.conf > "$LOG_OUTPUT" 2>&1
+    sleep 3
+    if ! pgrep hostapd >/dev/null; then
+        error "Hostapd falló al iniciar. Verifica $LOG_OUTPUT"
+        echo "--- ULTIMAS LINEAS DEL LOG ---"
+        tail -n 10 "$LOG_OUTPUT"
+        exit 1
+    fi
+    log "Hostapd corriendo."
+
+    # Asegurar IP antes de dnsmasq (a veces hostapd la borra al iniciar)
+    log "Re-aplicando IP al interfaz..."
+    ip addr add "$GATEWAY_IP/24" dev "$INTERFACE_WIFI" 2>/dev/null
+    ip link set "$INTERFACE_WIFI" up
+
+    log "Iniciando dnsmasq..."
+    dnsmasq -C /etc/dnsmasq.conf
+    sleep 1
+    if ! pgrep dnsmasq >/dev/null; then
+        error "dnsmasq falló al iniciar. Posible conflicto puerto 53."
+        log "Intentando matar procesos en puerto 53..."
+        fuser -k 53/tcp 2>/dev/null
+        fuser -k 53/udp 2>/dev/null
+        dnsmasq -C /etc/dnsmasq.conf
+    fi
+
+    if pgrep dnsmasq >/dev/null; then
+         log "dnsmasq corriendo."
+    else
+         error "dnsmasq NO pudo arrancar."
+         exit 1
+    fi
+
+    log "Iniciando NoDogSplash..."
+    nodogsplash >/dev/null 2>&1
+
+    sleep 1
+    if ! pgrep nodogsplash >/dev/null; then
+        error "NoDogSplash no arrancó."
+        exit 1
+    fi
+    log "NoDogSplash corriendo."
+}
+
+check_root
+prepare_system
+setup_hostapd
+setup_dnsmasq
+setup_firewall
+setup_nodogsplash
+start_services
+
+echo ""
+echo -e "${BLUE}=======================================${NC}"
+echo -e "${GREEN}   PORTAL CAUTIVO MANUAL ACTIVO${NC}"
+echo -e "${BLUE}=======================================${NC}"
+echo -e " SSID: $SSID"
+echo -e " Pass: $PASSPHRASE"
+echo -e " IP:   $GATEWAY_IP"
+echo -e ""
+echo -e "${YELLOW}NOTA: Se ha desactivado el WiFi en NetworkManager.${NC}"
+echo -e "${YELLOW}Para revertir: nmcli radio wifi on${NC}"
